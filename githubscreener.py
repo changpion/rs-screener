@@ -349,17 +349,56 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
     st.success(f"Found {len(results_list)} structurally strong {run_cap} Cap matches!")
     st.markdown("---")
 
-    CHARTS_PER_PAGE = 4
+        CHARTS_PER_PAGE = 4
     total_pages = max(1, (len(results_list) - 1) // CHARTS_PER_PAGE + 1)
 
-    p_col1, p_col2 = st.columns([1, 4])
-    with p_col1:
-        current_page = st.number_input(f"Page (1 of {total_pages})", min_value=1, max_value=total_pages, value=1, step=1, key=f"page_{key_prefix}_{run_cap.lower()}_{run_mode.lower()}")
-    with p_col2:
-        start_idx = (current_page - 1) * CHARTS_PER_PAGE
-        end_idx = start_idx + CHARTS_PER_PAGE
-        page_results = results_list[start_idx:end_idx]
-        st.write(f"### Viewing charts **{start_idx + 1}** to **{min(end_idx, len(results_list))}**")
+    # Persistent page tracking via session state
+    page_state_key = (
+        f"page_num_{key_prefix}_{run_cap.lower()}_{run_mode.lower()}"
+    )
+    if page_state_key not in st.session_state:
+      st.session_state[page_state_key] = 1
+
+    # Safety bounds check
+    if st.session_state[page_state_key] > total_pages:
+      st.session_state[page_state_key] = total_pages
+
+    # Thumb-friendly navigation bar
+    b_col1, b_col2, b_col3 = st.columns([1, 2, 1])
+    with b_col1:
+      if st.button("⬅️ Prev", key=f"prev_{key_prefix}", use_container_width=True):
+        if st.session_state[page_state_key] > 1:
+          st.session_state[page_state_key] -= 1
+          st.rerun()
+
+    with b_col2:
+      st.markdown(
+          f"<div style='text-align: center; padding-top: 8px;'>Page"
+          f" <b>{st.session_state[page_state_key]}</b> of"
+          f" <b>{total_pages}</b></div>",
+          unsafe_allow_html=True,
+      )
+
+    with b_col3:
+      if st.button(
+          "Next ➡️", key=f"next_{key_prefix}", use_container_width=True
+      ):
+        if st.session_state[page_state_key] < total_pages:
+          st.session_state[page_state_key] += 1
+          st.rerun()
+
+    current_page = st.session_state[page_state_key]
+    start_idx = (current_page - 1) * CHARTS_PER_PAGE
+    end_idx = start_idx + CHARTS_PER_PAGE
+    page_results = results_list[start_idx:end_idx]
+
+    st.markdown(
+        f"<p style='text-align: center; color: #888;'>Showing matches"
+        f" <b>{start_idx + 1}</b> to <b>{min(end_idx, len(results_list))}</b> of"
+        f" {len(results_list)}</p>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
 
     for idx in range(0, len(page_results), 3):
         chunk = page_results[idx:idx + 3]
