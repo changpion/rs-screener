@@ -349,7 +349,7 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
     st.success(f"Found {len(results_list)} structurally strong {run_cap} Cap matches!")
     st.markdown("---")
 
-    CHARTS_PER_PAGE = 12
+    CHARTS_PER_PAGE = 4
     total_pages = max(1, (len(results_list) - 1) // CHARTS_PER_PAGE + 1)
 
     p_col1, p_col2 = st.columns([1, 4])
