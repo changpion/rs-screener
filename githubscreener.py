@@ -341,6 +341,13 @@ if run_scan:
         st.session_state[scan_key] = results
 
 
+# --- STATE-SAFE PAGINATION FUNCTIONS ---
+def change_page(state_key, delta, max_p):
+    st.session_state[state_key] = max(1, min(st.session_state[state_key] + delta, max_p))
+
+def set_page_direct(state_key, input_key):
+    st.session_state[state_key] = st.session_state[input_key]
+
 def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long", run_cap="Mid"):
     if not results_list:
         st.info("No tickers matched the current scan criteria.")
@@ -364,25 +371,29 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
     st.markdown("---")
     col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
     with col_p1:
-        if st.button("⬅️ Prev", key=f"top_prev_{key_prefix}_{run_cap}_{run_mode}", use_container_width=True):
-            if st.session_state[page_state_key] > 1:
-                st.session_state[page_state_key] -= 1
-                st.rerun()
-    with col_p2:
-        new_page_top = st.number_input(
-            "Page", min_value=1, max_value=total_pages, value=int(current_page), step=1,
-            key=f"top_num_{key_prefix}_{run_cap}_{run_mode}", label_visibility="collapsed"
+        st.button(
+            "⬅️ Prev",
+            key=f"top_prev_{key_prefix}_{run_cap}_{run_mode}",
+            use_container_width=True,
+            on_click=change_page,
+            args=(page_state_key, -1, total_pages)
         )
-        if new_page_top != st.session_state[page_state_key]:
-            st.session_state[page_state_key] = new_page_top
-            st.rerun()
+    with col_p2:
+        top_num_key = f"top_num_{key_prefix}_{run_cap}_{run_mode}"
+        st.number_input(
+            "Page", min_value=1, max_value=total_pages, value=int(current_page), step=1,
+            key=top_num_key, label_visibility="collapsed",
+            on_change=set_page_direct, args=(page_state_key, top_num_key)
+        )
     with col_p3:
-        if st.button("Next ➡️", key=f"top_next_{key_prefix}_{run_cap}_{run_mode}", use_container_width=True):
-            if st.session_state[page_state_key] < total_pages:
-                st.session_state[page_state_key] += 1
-                st.rerun()
+        st.button(
+            "Next ➡️",
+            key=f"top_next_{key_prefix}_{run_cap}_{run_mode}",
+            use_container_width=True,
+            on_click=change_page,
+            args=(page_state_key, 1, total_pages)
+        )
 
-    current_page = st.session_state[page_state_key]
     start_idx = (current_page - 1) * CHARTS_PER_PAGE
     end_idx = start_idx + CHARTS_PER_PAGE
     page_results = results_list[start_idx:end_idx]
@@ -406,23 +417,28 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
     st.markdown("---")
     col_b1, col_b2, col_b3 = st.columns([1, 2, 1])
     with col_b1:
-        if st.button("⬅️ Prev", key=f"bot_prev_{key_prefix}_{run_cap}_{run_mode}", use_container_width=True):
-            if st.session_state[page_state_key] > 1:
-                st.session_state[page_state_key] -= 1
-                st.rerun()
-    with col_b2:
-        new_page_bot = st.number_input(
-            "Page", min_value=1, max_value=total_pages, value=int(current_page), step=1,
-            key=f"bot_num_{key_prefix}_{run_cap}_{run_mode}", label_visibility="collapsed"
+        st.button(
+            "⬅️ Prev",
+            key=f"bot_prev_{key_prefix}_{run_cap}_{run_mode}",
+            use_container_width=True,
+            on_click=change_page,
+            args=(page_state_key, -1, total_pages)
         )
-        if new_page_bot != st.session_state[page_state_key]:
-            st.session_state[page_state_key] = new_page_bot
-            st.rerun()
+    with col_b2:
+        bot_num_key = f"bot_num_{key_prefix}_{run_cap}_{run_mode}"
+        st.number_input(
+            "Page", min_value=1, max_value=total_pages, value=int(current_page), step=1,
+            key=bot_num_key, label_visibility="collapsed",
+            on_change=set_page_direct, args=(page_state_key, bot_num_key)
+        )
     with col_b3:
-        if st.button("Next ➡️", key=f"bot_next_{key_prefix}_{run_cap}_{run_mode}", use_container_width=True):
-            if st.session_state[page_state_key] < total_pages:
-                st.session_state[page_state_key] += 1
-                st.rerun()
+        st.button(
+            "Next ➡️",
+            key=f"bot_next_{key_prefix}_{run_cap}_{run_mode}",
+            use_container_width=True,
+            on_click=change_page,
+            args=(page_state_key, 1, total_pages)
+        )
 
 
 # --- TAB 2: ACTIVE SCREENER ---
