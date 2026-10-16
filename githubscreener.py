@@ -349,55 +349,42 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
     st.success(f"Found {len(results_list)} structurally strong {run_cap} Cap matches!")
     st.markdown("---")
 
-        CHARTS_PER_PAGE = 4
+    CHARTS_PER_PAGE = 4
     total_pages = max(1, (len(results_list) - 1) // CHARTS_PER_PAGE + 1)
 
-    # Persistent page tracking via session state
-    page_state_key = (
-        f"page_num_{key_prefix}_{run_cap.lower()}_{run_mode.lower()}"
-    )
+    page_state_key = f"page_num_{key_prefix}_{run_cap.lower()}_{run_mode.lower()}"
     if page_state_key not in st.session_state:
-      st.session_state[page_state_key] = 1
+        st.session_state[page_state_key] = 1
 
-    # Safety bounds check
     if st.session_state[page_state_key] > total_pages:
-      st.session_state[page_state_key] = total_pages
+        st.session_state[page_state_key] = total_pages
 
-    # Thumb-friendly navigation bar
+    # Thumb-friendly mobile navigation controls
     b_col1, b_col2, b_col3 = st.columns([1, 2, 1])
     with b_col1:
-      if st.button("⬅️ Prev", key=f"prev_{key_prefix}", use_container_width=True):
-        if st.session_state[page_state_key] > 1:
-          st.session_state[page_state_key] -= 1
-          st.rerun()
+        if st.button("⬅️ Prev", key=f"prev_{key_prefix}_{run_cap.lower()}_{run_mode.lower()}", use_container_width=True):
+            if st.session_state[page_state_key] > 1:
+                st.session_state[page_state_key] -= 1
+                st.rerun()
 
     with b_col2:
-      st.markdown(
-          f"<div style='text-align: center; padding-top: 8px;'>Page"
-          f" <b>{st.session_state[page_state_key]}</b> of"
-          f" <b>{total_pages}</b></div>",
-          unsafe_allow_html=True,
-      )
+        st.markdown(
+            f"<div style='text-align: center; padding-top: 8px;'>Page <b>{st.session_state[page_state_key]}</b> of <b>{total_pages}</b></div>",
+            unsafe_allow_html=True
+        )
 
     with b_col3:
-      if st.button(
-          "Next ➡️", key=f"next_{key_prefix}", use_container_width=True
-      ):
-        if st.session_state[page_state_key] < total_pages:
-          st.session_state[page_state_key] += 1
-          st.rerun()
+        if st.button("Next ➡️", key=f"next_{key_prefix}_{run_cap.lower()}_{run_mode.lower()}", use_container_width=True):
+            if st.session_state[page_state_key] < total_pages:
+                st.session_state[page_state_key] += 1
+                st.rerun()
 
     current_page = st.session_state[page_state_key]
     start_idx = (current_page - 1) * CHARTS_PER_PAGE
     end_idx = start_idx + CHARTS_PER_PAGE
     page_results = results_list[start_idx:end_idx]
 
-    st.markdown(
-        f"<p style='text-align: center; color: #888;'>Showing matches"
-        f" <b>{start_idx + 1}</b> to <b>{min(end_idx, len(results_list))}</b> of"
-        f" {len(results_list)}</p>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<p style='text-align: center; color: #888;'>Showing matches <b>{start_idx + 1}</b> to <b>{min(end_idx, len(results_list))}</b> of {len(results_list)}</p>", unsafe_allow_html=True)
     st.markdown("---")
 
     for idx in range(0, len(page_results), 3):
@@ -409,8 +396,7 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
                 m_c1, m_c2, m_c3 = st.columns(3)
                 m_c1.metric("Close", f"${r.close:.2f}")
                 m_c2.metric("RS Edge", f"{r.factor_edge:+.2f}" if run_mode == "Long" else f"{r.factor_edge:.2f}")
-                label_txt = "Dist 20SMA" if run_mode == "Long" else "Dist 20SMA"
-                m_c3.metric(label_txt, f"{r.dist_sma20:+.2f}%")
+                m_c3.metric("Dist 20SMA", f"{r.dist_sma20:+.2f}%")
 
                 render_tv_chart(r.ticker, mode=run_mode)
 
