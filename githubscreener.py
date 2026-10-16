@@ -236,6 +236,33 @@ mode_clean = "Long" if "Long Setup" in strategy_mode else "Short"
 
 st.title(f"{strategy_mode} (Daily Chart Strategy)")
 
+# --- RESPONSIVE MOBILE CSS FIX FOR METRICS ---
+st.markdown(
+    """
+    <style>
+    [data-testid="stMetricLabel"] {
+        font-size: 0.8rem !important;
+        white-space: normal !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.1rem !important;
+        white-space: normal !important;
+    }
+    [data-testid="stMetricDelta"] {
+        font-size: 0.75rem !important;
+    }
+    [data-testid="stMetric"] { 
+        background-color: #1E1E1E;
+        border: 1px solid #333333;
+        padding: 6px 10px;
+        border-radius: 6px;
+        overflow: hidden;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 if "spy_data" not in st.session_state or st.session_state.spy_data is None:
     st.session_state.spy_data = fetch_daily_ohlcv("SPY")
 
@@ -342,8 +369,8 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
                 st.markdown(f"### 📊 {r.ticker}")
                 m_c1, m_c2, m_c3 = st.columns(3)
                 m_c1.metric("Close", f"${r.close:.2f}")
-                m_c2.metric("RS Delta/Edge", f"{r.factor_edge:+.2f}" if run_mode == "Long" else f"{r.factor_edge:.2f}")
-                label_txt = "Dist to 20 SMA (Supp)" if run_mode == "Long" else "Dist to 20 SMA (Res)"
+                m_c2.metric("RS Edge", f"{r.factor_edge:+.2f}" if run_mode == "Long" else f"{r.factor_edge:.2f}")
+                label_txt = "Dist 20SMA" if run_mode == "Long" else "Dist 20SMA"
                 m_c3.metric(label_txt, f"{r.dist_sma20:+.2f}%")
 
                 render_tv_chart(r.ticker, mode=run_mode)
