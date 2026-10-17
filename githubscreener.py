@@ -12,8 +12,7 @@ from urllib3.util.retry import Retry
 # --- CONFIGURATION & TOOLS ---
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-MIN_BARS = 40
-LOOKBACK_CANDLES = 20  # Aligned to 1 month worth of daily market movement
+MIN_BARS = 130  # Required for 120-day (6-month) RS calculation
 MAX_TICKERS_LIMIT = 500
 
 SECTOR_MAP = {
@@ -23,7 +22,7 @@ SECTOR_MAP = {
     "XLU": "Utilities", "XLRE": "Real Estate"
 }
 
-# --- PERSISTENT SESSION WITH RETRIES (CRITICAL FOR CLOUD HOSTING) ---
+# --- PERSISTENT SESSION WITH RETRIES ---
 @st.cache_resource
 def get_http_session():
     session = requests.Session()
@@ -43,20 +42,20 @@ def get_http_session():
 class ScreenResult:
     ticker: str
     close: float
-    sma8: float
+    ema10: float
     sma20: float
-    return_7: float
-    spy_return_7: float
-    rs_factor: float
-    spy_rs_factor: float
+    adr_pct: float
+    vol_dryup_ratio: float
+    composite_rs: float
+    spy_composite_rs: float
 
     @property
     def factor_edge(self) -> float:
-        return self.rs_factor - self.spy_rs_factor
+        return self.composite_rs - self.spy_composite_rs
 
     @property
-    def dist_sma8(self) -> float:
-        return ((self.close - self.sma8) / self.sma8) * 100
+    def dist_ema10(self) -> float:
+        return ((self.close - self.ema10) / self.ema10) * 100
 
     @property
     def dist_sma20(self) -> float:
@@ -67,19 +66,47 @@ class ScreenResult:
         return abs(self.dist_sma20)
 
 
-# --- MATH & DATA FUNCTIONS ---
-def calc_rs_factor(closes, lookback=LOOKBACK_CANDLES):
-    window = closes.iloc[-lookback:]
-    if len(window) < lookback:
+# --- MULTI-TIMEFRAME RS & QUANT MATH ---
+def calc_rs_metrics(df):
+    """
+    Calculates Composite RS Score weighted across 1M (20d), 3M (60d), and 6M (120d).
+    Also extracts 20-day ADR% and Volume Dry-Up ratio.
+    """
+    closes = df["close"]
+    if len(closes) < MIN_BARS:
         return None
-    period_return = (window.iloc[-1] / window.iloc[0] - 1) * 100
-    bar_returns = window.pct_change().dropna()
-    if len(bar_returns) < 2:
-        return None
+
+    # Multi-window returns
+    ret_20 = (closes.iloc[-1] / closes.iloc[-20] - 1) * 100
+    ret_60 = (closes.iloc[-1] / closes.iloc[-60] - 1) * 100
+    ret_120 = (closes.iloc[-1] / closes.iloc[-120] - 1) * 100
+
+    # Volatility normalization over recent month
+    bar_returns = closes.iloc[-20:].pct_change().dropna()
     volatility = bar_returns.std() * 100
     if pd.isna(volatility) or volatility <= 0:
         return None
-    return float(period_return), float(period_return / volatility)
+
+    # Weighted composite performance score
+    composite_return = (0.4 * ret_20) + (0.4 * ret_60) + (0.2 * ret_120)
+    composite_rs = composite_return / volatility
+
+    # ADR% Calculation (Average Daily Range over 20 days)
+    if "high" in df.columns and "low" in df.columns:
+        daily_range = ((df["high"].iloc[-20:] - df["low"].iloc[-20:]) / df["low"].iloc[-20:]) * 100
+        adr_pct = float(daily_range.mean())
+    else:
+        adr_pct = float(volatility * 1.5)
+
+    # Volume Dry-Up Ratio (5-day avg volume vs 20-day avg volume)
+    if "volume" in df.columns:
+        vol_5 = df["volume"].iloc[-5:].mean()
+        vol_20 = df["volume"].iloc[-20:].mean()
+        vol_dryup = float(vol_5 / vol_20) if vol_20 > 0 else 1.0
+    else:
+        vol_dryup = 1.0
+
+    return float(composite_return), float(composite_rs), float(adr_pct), float(vol_dryup)
 
 
 @st.cache_data(ttl=86400)
@@ -103,7 +130,7 @@ def fetch_daily_ohlcv(ticker):
     try:
         response = session.get(
             YAHOO_CHART_URL.format(ticker=ticker),
-            params={"interval": "1d", "range": "60d"},
+            params={"interval": "1d", "range": "180d"},
             timeout=10
         )
         if response.status_code != 200:
@@ -111,7 +138,12 @@ def fetch_daily_ohlcv(ticker):
         result = response.json()["chart"]["result"][0]
         quote = result["indicators"]["quote"][0]
         df = pd.DataFrame(
-            {"close": quote.get("close")},
+            {
+                "close": quote.get("close"),
+                "high": quote.get("high"),
+                "low": quote.get("low"),
+                "volume": quote.get("volume")
+            },
             index=pd.to_datetime(result["timestamp"], unit="s", utc=True)
         )
         df = df.dropna(subset=["close"])
@@ -121,7 +153,7 @@ def fetch_daily_ohlcv(ticker):
 
 
 def get_quant_sector_strength(spy_df, mode="Long"):
-    spy_metrics = calc_rs_factor(spy_df["close"])
+    spy_metrics = calc_rs_metrics(spy_df)
     if not spy_metrics:
         return None
 
@@ -133,13 +165,13 @@ def get_quant_sector_strength(spy_df, mode="Long"):
             try:
                 df = future.result()
                 if df is not None:
-                    sec_metrics = calc_rs_factor(df["close"])
+                    sec_metrics = calc_rs_metrics(df)
                     if sec_metrics:
                         edge = sec_metrics[1] - spy_metrics[1]
                         sector_results.append({
                             "ETF": etf,
                             "Sector Name": SECTOR_MAP[etf],
-                            "Return %": sec_metrics[0],
+                            "Composite Return %": sec_metrics[0],
                             "RS Factor Edge": edge
                         })
             except Exception:
@@ -152,30 +184,58 @@ def get_quant_sector_strength(spy_df, mode="Long"):
     return None
 
 
-def screen_ticker(ticker, df, spy_metrics, mode="Long"):
+# --- DEDICATED LONG SCREENER (Qullamaggie Principles) ---
+def screen_long_ticker(ticker, df, spy_metrics):
     df = df.copy()
-    df["SMA8"] = df["close"].rolling(8).mean()
+    df["EMA10"] = df["close"].ewm(span=10, adjust=False).mean()
     df["SMA20"] = df["close"].rolling(20).mean()
     latest = df.iloc[-1]
 
-    if pd.isna(latest["SMA8"]) or pd.isna(latest["SMA20"]):
+    if pd.isna(latest["EMA10"]) or pd.isna(latest["SMA20"]):
         return None
 
-    close, sma8, sma20 = float(latest["close"]), float(latest["SMA8"]), float(latest["SMA20"])
-    stock_metrics = calc_rs_factor(df["close"])
+    close, ema10, sma20 = float(latest["close"]), float(latest["EMA10"]), float(latest["SMA20"])
+    stock_metrics = calc_rs_metrics(df)
     if not stock_metrics:
         return None
 
-    if mode == "Long":
-        if latest["SMA8"] <= latest["SMA20"]: return None
-        if close < sma8 and close < sma20: return None
-        if stock_metrics[1] <= spy_metrics[1]: return None
-    else:
-        if latest["SMA8"] >= latest["SMA20"]: return None
-        if close > sma8 and close > sma20: return None
-        if stock_metrics[1] >= spy_metrics[1]: return None
+    _, stock_rs, adr_pct, vol_dryup = stock_metrics
+    spy_rs = spy_metrics[1]
 
-    return ScreenResult(ticker, close, sma8, sma20, stock_metrics[0], spy_metrics[0], stock_metrics[1], spy_metrics[1])
+    # Filters: High ADR, Bullish MA alignment (EMA10 > SMA20), Price surfing MAs, Outperforming SPY RS
+    if adr_pct < 2.5: return None
+    if ema10 <= sma20: return None
+    if close < ema10 and close < sma20: return None
+    if stock_rs <= spy_rs: return None
+
+    return ScreenResult(ticker, close, ema10, sma20, adr_pct, vol_dryup, stock_rs, spy_rs)
+
+
+# --- DEDICATED SHORT SCREENER (Trending Breakdown & Relative Weakness) ---
+def screen_short_ticker(ticker, df, spy_metrics):
+    df = df.copy()
+    df["EMA10"] = df["close"].ewm(span=10, adjust=False).mean()
+    df["SMA20"] = df["close"].rolling(20).mean()
+    latest = df.iloc[-1]
+
+    if pd.isna(latest["EMA10"]) or pd.isna(latest["SMA20"]):
+        return None
+
+    close, ema10, sma20 = float(latest["close"]), float(latest["EMA10"]), float(latest["SMA20"])
+    stock_metrics = calc_rs_metrics(df)
+    if not stock_metrics:
+        return None
+
+    _, stock_rs, adr_pct, vol_dryup = stock_metrics
+    spy_rs = spy_metrics[1]
+
+    # Filters: High ADR, Bearish MA alignment (EMA10 < SMA20), Price below MAs, Underperforming SPY RS
+    if adr_pct < 2.5: return None
+    if ema10 >= sma20: return None
+    if close > ema10 and close > sma20: return None
+    if stock_rs >= spy_rs: return None
+
+    return ScreenResult(ticker, close, ema10, sma20, adr_pct, vol_dryup, stock_rs, spy_rs)
 
 
 def render_tv_chart(ticker: str, mode="Long"):
@@ -201,14 +261,14 @@ def render_tv_chart(ticker: str, mode="Long"):
             "allow_symbol_change": false,
             "container_id": "tv-chart-{ticker}",
             "studies": [
-                {{ "id": "MASimple@tv-basicstudies", "inputs": {{ "length": 8 }} }},
+                {{ "id": "MAExp@tv-basicstudies", "inputs": {{ "length": 10 }} }},
                 {{ "id": "MASimple@tv-basicstudies", "inputs": {{ "length": 20 }} }}
             ],
             "studies_overrides": {{
-                "moving average.moving average.color": "{ma_color_1}",
-                "moving average.moving average.linewidth": 2,
-                "moving average 2.moving average.color": "{ma_color_2}",
-                "moving average 2.moving average.linewidth": 2
+                "moving average exponential.moving average.color": "{ma_color_1}",
+                "moving average exponential.moving average.linewidth": 2,
+                "moving average.moving average.color": "{ma_color_2}",
+                "moving average.moving average.linewidth": 2
             }}
         }});
         </script>
@@ -218,7 +278,7 @@ def render_tv_chart(ticker: str, mode="Long"):
 
 
 # --- STREAMLIT UI SETUP ---
-st.set_page_config(page_title="Daily Quant Multi-Directional Screener", layout="wide")
+st.set_page_config(page_title="Multi-Directional Quant Screener", layout="wide")
 
 st.sidebar.header("🧭 Navigation & Strategy")
 strategy_mode = st.sidebar.radio(
@@ -234,9 +294,9 @@ strategy_mode = st.sidebar.radio(
 cap_clean = "Mid" if "Mid Cap" in strategy_mode else "Large"
 mode_clean = "Long" if "Long Setup" in strategy_mode else "Short"
 
-st.title(f"{strategy_mode} (Daily Chart Strategy)")
+st.title(f"{strategy_mode} ({'Qullamaggie Long Framework' if mode_clean == 'Long' else 'Trending Breakdown Short'})")
 
-# --- RESPONSIVE MOBILE CSS FIX FOR METRICS ---
+# --- RESPONSIVE MOBILE CSS FIX ---
 st.markdown(
     """
     <style>
@@ -268,21 +328,21 @@ if "spy_data" not in st.session_state or st.session_state.spy_data is None:
 
 tab_home, tab_screener, tab_entries = st.tabs([
     "📊 Sector Performance Tracker",
-    "🔍 Live Daily Quant Filters",
+    "🔍 Live Multi-Timeframe RS Screener",
     "🎯 Optimal Entry Risk Profile"
 ])
 
 # --- TAB 1: QUANT SECTOR OVERVIEW ---
 with tab_home:
-    st.header(f"📊 Quant Sector Relative {'Strength' if mode_clean == 'Long' else 'Weakness'}")
-    st.write(f"Sectors ranked dynamically against SPY over the last {LOOKBACK_CANDLES} daily candles.")
+    st.header(f"📊 Sector Composite RS Tracker ({'Long Leader' if mode_clean == 'Long' else 'Short Deficit'})")
+    st.write("Sectors ranked dynamically against SPY across a weighted 1M / 3M / 6M composite timeframe.")
 
     if st.session_state.spy_data is None:
         st.error("Failed to fetch SPY benchmark data.")
     else:
         cache_key = f"sector_df_{mode_clean}"
         if st.button("🔄 Refresh Sector Metrics") or cache_key not in st.session_state:
-            with st.spinner("Re-calculating math variables..."):
+            with st.spinner("Re-calculating multi-window sector math..."):
                 st.session_state[cache_key] = get_quant_sector_strength(st.session_state.spy_data, mode=mode_clean)
 
         sectors_df = st.session_state.get(cache_key)
@@ -290,9 +350,9 @@ with tab_home:
         if sectors_df is not None and not sectors_df.empty:
             prime_sector = sectors_df.iloc[0]
             if mode_clean == "Long":
-                st.success(f"🔥 **Leading Market Sector:** {prime_sector['Sector Name']} ({prime_sector['ETF']}) with an RS Edge of **{prime_sector['RS Factor Edge']:+.2f}**")
+                st.success(f"🔥 **Leading Market Sector:** {prime_sector['Sector Name']} ({prime_sector['ETF']}) with Composite RS Edge of **{prime_sector['RS Factor Edge']:+.2f}**")
             else:
-                st.error(f"⚠️ **Weakest Market Sector:** {prime_sector['Sector Name']} ({prime_sector['ETF']}) with an RS Deficit of **{prime_sector['RS Factor Edge']:.2f}**")
+                st.error(f"⚠️ **Weakest Market Sector:** {prime_sector['Sector Name']} ({prime_sector['ETF']}) with Composite RS Deficit of **{prime_sector['RS Factor Edge']:.2f}**")
 
             st.dataframe(sectors_df, hide_index=True, use_container_width=True)
 
@@ -315,8 +375,8 @@ if run_scan:
         status_text = st.empty()
         progress_bar = st.progress(0)
 
-        status_text.text("Calculating Benchmark Metrics...")
-        spy_metrics = calc_rs_factor(st.session_state.spy_data["close"])
+        status_text.text("Calculating Multi-Timeframe SPY Baseline...")
+        spy_metrics = calc_rs_metrics(st.session_state.spy_data)
 
         tickers = get_us_tickers(cap_size=cap_clean)
         results = []
@@ -331,12 +391,16 @@ if run_scan:
                 try:
                     df = future.result()
                     if df is not None:
-                        hit = screen_ticker(ticker, df, spy_metrics, mode=mode_clean)
+                        # Route to correct engine based on current strategy mode
+                        if mode_clean == "Long":
+                            hit = screen_long_ticker(ticker, df, spy_metrics)
+                        else:
+                            hit = screen_short_ticker(ticker, df, spy_metrics)
                         if hit: results.append(hit)
                 except Exception:
                     pass
 
-        status_text.text("Completed scanning algorithm successfully!")
+        status_text.text("Completed multi-timeframe scan successfully!")
         progress_bar.empty()
         st.session_state[scan_key] = results
 
@@ -353,7 +417,7 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
         st.info("No tickers matched the current scan criteria.")
         return
 
-    st.success(f"Found {len(results_list)} structurally strong {run_cap} Cap matches!")
+    st.success(f"Found {len(results_list)} matching {run_cap} Cap candidates!")
 
     CHARTS_PER_PAGE = 4
     total_pages = max(1, (len(results_list) - 1) // CHARTS_PER_PAGE + 1)
@@ -409,8 +473,8 @@ def display_paginated_charts(results_list, key_prefix="screener", run_mode="Long
                 st.markdown(f"### 📊 {r.ticker}")
                 m_c1, m_c2, m_c3 = st.columns(3)
                 m_c1.metric("Close", f"${r.close:.2f}")
-                m_c2.metric("RS Edge", f"{r.factor_edge:+.2f}" if run_mode == "Long" else f"{r.factor_edge:.2f}")
-                m_c3.metric("Dist 20SMA", f"{r.dist_sma20:.2f}%")
+                m_c2.metric("Composite RS Edge", f"{r.factor_edge:+.2f}" if run_mode == "Long" else f"{r.factor_edge:.2f}")
+                m_c3.metric("ADR%", f"{r.adr_pct:.2f}%")
                 render_tv_chart(r.ticker, mode=run_mode)
 
     # --- BOTTOM NAVIGATION BAR ---
