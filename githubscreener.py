@@ -448,11 +448,4 @@ def screen_ep_ticker(ticker, df):
     return None
 
   prior_60 = df.iloc[-61:-1]
-  base_high = prior_60["high"].max()
-  base_low = prior_60["low"].min()
-  base_range_pct = (
-      ((base_high - base_low) / base_low) * 100 if base_low > 0 else 0.0
-  )
-
-  daily_range = (
-      (df["high"].iloc[-20:] - df["low"].iloc[-
+  base_high
