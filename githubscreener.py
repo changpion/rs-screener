@@ -60,7 +60,7 @@ def get_http_session():
   return session
 
 
-# --- DATACLASSES ---
+# --- DATACLASSES (UPDATED WITH SECTOR ATTRIBUTES) ---
 @dataclass
 class ScreenResult:
   ticker: str
@@ -71,22 +71,16 @@ class ScreenResult:
   vol_dryup_ratio: float
   composite_rs: float
   spy_composite_rs: float
+  sector: str = "Unmapped"
+  sector_rank: int = 99
 
   @property
   def factor_edge(self) -> float:
     return self.composite_rs - self.spy_composite_rs
 
   @property
-  def dist_ema10(self) -> float:
-    return ((self.close - self.ema10) / self.ema10) * 100
-
-  @property
-  def dist_sma20(self) -> float:
-    return ((self.close - self.sma20) / self.sma20) * 100
-
-  @property
   def entry_risk_sma20(self) -> float:
-    return abs(self.dist_sma20)
+    return abs(((self.close - self.sma20) / self.sma20) * 100)
 
 
 @dataclass
@@ -97,6 +91,8 @@ class EPResult:
   rvol: float
   base_range_pct: float
   adr_pct: float
+  sector: str = "Unmapped"
+  sector_rank: int = 99
 
   @property
   def factor_edge(self) -> float:
@@ -165,7 +161,7 @@ def calc_rs_metrics(df, mode="Long"):
   )
 
 
-# --- MARKET HEALTH TRAFFIC LIGHT (SUGGESTION 3) ---
+# --- MARKET HEALTH TRAFFIC LIGHT ---
 def get_market_health_status(spy_df, qqq_df):
   if spy_df is None or qqq_df is None:
     return "UNKNOWN", "#888888", "Data Unavailable"
@@ -176,10 +172,10 @@ def get_market_health_status(spy_df, qqq_df):
     sma20 = closes.rolling(20).mean().iloc[-1]
     last_close = closes.iloc[-1]
     if last_close > ema10 and ema10 > sma20:
-      return 2  # Full Bull
+      return 2
     elif last_close > sma20:
-      return 1  # Moderate/Pullback
-    return 0  # Bearish/Defense
+      return 1
+    return 0
 
   spy_score = eval_index(spy_df)
   qqq_score = eval_index(qqq_df)
@@ -205,58 +201,62 @@ def get_market_health_status(spy_df, qqq_df):
     )
 
 
-# --- TICKER LIST PARSER ---
+# --- WIKIPEDIA TICKER & SECTOR PARSER ---
 @st.cache_data(ttl=86400)
-def get_us_tickers(cap_size="Mid"):
+def get_us_tickers_with_sectors(cap_size="Mid"):
   session = get_http_session()
+  sector_dict = {}
   try:
     if cap_size == "Small":
-      url = "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"
+      urls = ["https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"]
     elif cap_size == "Mid":
-      url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
+      urls = ["https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"]
     elif cap_size == "Large":
-      url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+      urls = ["https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"]
     else:  # Combined S&P 1500
-      t_large = get_us_tickers("Large")
-      t_mid = get_us_tickers("Mid")
-      t_small = get_us_tickers("Small")
-      return sorted(list(set(t_large + t_mid + t_small)))
+      urls = [
+          "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+          "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+          "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
+      ]
 
-    resp = session.get(url, timeout=15)
-    resp.raise_for_status()
+    for url in urls:
+      resp = session.get(url, timeout=15)
+      resp.raise_for_status()
+      dfs = pd.read_html(StringIO(resp.text), match="Symbol")
+      df = dfs[0]
 
-    dfs = pd.read_html(StringIO(resp.text), match="Symbol")
-    df = dfs[0]
+      t_col = next(
+          (
+              c
+              for c in df.columns
+              if "symbol" in str(c).lower() or "ticker" in str(c).lower()
+          ),
+          None,
+      )
+      s_col = next(
+          (c for c in df.columns if "sector" in str(c).lower()), None
+      )
 
-    ticker_col = next(
-        (
-            col
-            for col in df.columns
-            if "symbol" in str(col).lower() or "ticker" in str(col).lower()
-        ),
-        None,
-    )
+      if t_col:
+        for _, row in df.iterrows():
+          t = str(row[t_col]).strip().replace(".", "-").upper()
+          sec = (
+              str(row[s_col]).strip()
+              if s_col and not pd.isna(row[s_col])
+              else "General"
+          )
+          sector_dict[t] = sec
 
-    if ticker_col is None:
-      raise ValueError("Ticker column not identified.")
-
-    tickers = (
-        df[ticker_col]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .str.replace(".", "-", regex=False)
-        .tolist()
-    )
-
-    return sorted(list(set(tickers)))[:MAX_TICKERS_LIMIT]
-
+    if not sector_dict:
+      raise ValueError("Empty ticker map")
+    return sector_dict
   except Exception as e:
     st.warning(
-        f"⚠️ Warning: Live ticker fetch for {cap_size} Cap failed ({e})."
-        " Using default fallbacks."
+        f"⚠️ Warning: Live sector/ticker fetch failed ({e}). Using default"
+        " fallback universe."
     )
-    return [
+    defaults = [
         "AAPL",
         "MSFT",
         "NVDA",
@@ -270,6 +270,12 @@ def get_us_tickers(cap_size="Mid"):
         "JPM",
         "TSLA",
     ]
+    return {
+        t: "Technology"
+        if t in ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AVGO"]
+        else "General"
+        for t in defaults
+    }
 
 
 def fetch_daily_ohlcv(ticker):
@@ -365,7 +371,14 @@ def screen_long_ticker(ticker, df, spy_metrics):
     return None
 
   return ScreenResult(
-      ticker, close, ema10, sma20, adr_pct, vol_dryup, stock_rs, spy_rs
+      ticker=ticker,
+      close=close,
+      ema10=ema10,
+      sma20=sma20,
+      adr_pct=adr_pct,
+      vol_dryup_ratio=vol_dryup,
+      composite_rs=stock_rs,
+      spy_composite_rs=spy_rs,
   )
 
 
@@ -400,7 +413,14 @@ def screen_short_ticker(ticker, df, spy_metrics):
     return None
 
   return ScreenResult(
-      ticker, close, ema10, sma20, adr_pct, vol_dryup, stock_rs, spy_rs
+      ticker=ticker,
+      close=close,
+      ema10=ema10,
+      sma20=sma20,
+      adr_pct=adr_pct,
+      vol_dryup_ratio=vol_dryup,
+      composite_rs=stock_rs,
+      spy_composite_rs=spy_rs,
   )
 
 
@@ -559,7 +579,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# --- SIDEBAR: POSITION SIZING & ADR RISK CALCULATOR (SUGGESTION 1) ---
+# --- SIDEBAR: POSITION SIZING & ADR RISK CALCULATOR ---
 st.sidebar.markdown("---")
 with st.sidebar.expander("🧮 Position Sizer & ADR Risk Calculator"):
   acc_size = st.number_input(
@@ -597,11 +617,10 @@ with st.sidebar.expander("🧮 Position Sizer & ADR Risk Calculator"):
     st.markdown(f"**Total Dollar Risk:** `${risk_dollars:,.2f}`")
     st.markdown(f"**Stop Distance:** `{stop_dist_pct:.2f}%`")
 
-    # ADR Compliance Safeguard Check
     if stop_dist_pct > est_adr:
       st.error(
           f"⚠️ **Wide Stop Warning:** Stop distance ({stop_dist_pct:.2f}%) is"
-          f" larger than 1.0x ADR ({est_adr:.2f}%). Consider a tighter low-of-day stop."
+          f" larger than 1.0x ADR ({est_adr:.2f}%). Consider a tighter stop."
       )
     else:
       st.success("✅ Stop distance compliant with ADR volatility limits.")
@@ -657,4 +676,260 @@ run_scan = st.sidebar.button(
 
 scan_key = f"scan_results_{cap_clean.replace(' ', '_').lower()}_{mode_clean.lower()}"
 if scan_key not in st.session_state:
-    st.session_state[scan_key] = None
+  st.session_state[scan_key] = None
+
+if run_scan:
+  if st.session_state.spy_data is None:
+    st.session_state.spy_data = fetch_daily_ohlcv("SPY")
+
+  if st.session_state.spy_data is None:
+    st.error("Could not fetch SPY baseline structural indexes.")
+  else:
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+
+    status_text.text("Fetching Ticker Universe & Sectors...")
+    ticker_sector_map = get_us_tickers_with_sectors(cap_size=cap_clean)
+    tickers = sorted(list(ticker_sector_map.keys()))[:MAX_TICKERS_LIMIT]
+
+    spy_metrics = (
+        calc_rs_metrics(st.session_state.spy_data, mode="Long")
+        if mode_clean != "Short"
+        else calc_rs_metrics(st.session_state.spy_data, mode="Short")
+    )
+
+    # Build Sector Ranking Lookup Map
+    sectors_df = st.session_state.get(
+        f"sector_df_{'Long' if mode_clean != 'Short' else 'Short'}"
+    )
+    sector_rank_lookup = {}
+    if sectors_df is not None and not sectors_df.empty:
+      for rank, row in enumerate(sectors_df.to_dict("records"), start=1):
+        sector_rank_lookup[row["Sector Name"]] = rank
+
+    results = []
+    status_text.text(
+        f"Screening {len(tickers)} symbols for {cap_clean} Cap {mode_clean}"
+        " parameters..."
+    )
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+      futures = {pool.submit(fetch_daily_ohlcv, t): t for t in tickers}
+      for i, future in enumerate(as_completed(futures)):
+        ticker = futures[future]
+        progress_bar.progress((i + 1) / len(tickers))
+        try:
+          df = future.result()
+          if df is not None:
+            if mode_clean == "EP":
+              hit = screen_ep_ticker(ticker, df)
+            elif mode_clean == "Long":
+              hit = screen_long_ticker(ticker, df, spy_metrics)
+            else:
+              hit = screen_short_ticker(ticker, df, spy_metrics)
+
+            if hit:
+              hit.sector = ticker_sector_map.get(ticker, "General")
+              hit.sector_rank = sector_rank_lookup.get(hit.sector, 99)
+              results.append(hit)
+        except Exception:
+          pass
+
+    status_text.text("Completed scan successfully!")
+    progress_bar.empty()
+    st.session_state[scan_key] = results
+
+
+def change_page(state_key, delta, max_p):
+  st.session_state[state_key] = max(
+      1, min(st.session_state[state_key] + delta, max_p)
+  )
+
+
+def set_page_direct(state_key, input_key):
+  st.session_state[state_key] = st.session_state[input_key]
+
+
+def display_paginated_charts(
+    results_list, key_prefix="screener", run_mode="Long", run_cap="Mid"
+):
+  if not results_list:
+    st.info("No tickers matched the current scan criteria.")
+    return
+
+  # --- MULTI-FACTOR SORTING DROPDOWN (INCLUDING SECTOR LEADER RANK) ---
+  col_sort1, col_sort2 = st.columns([2, 1])
+  with col_sort1:
+    sort_choice = st.selectbox(
+        "🔀 Sort Candidates By:",
+        [
+            "👑 Sector Leader Rank (#1 Sectors First)",
+            "🔥 RS Edge / Gap % (Highest First)",
+            "⚡ ADR % (Highest Volatility)",
+            "🎯 Tightest Base / Risk to SMA20",
+        ],
+        key=f"sort_select_{key_prefix}",
+    )
+
+  if "Sector Leader" in sort_choice:
+    results_list = sorted(
+        results_list, key=lambda r: (r.sector_rank, -r.factor_edge)
+    )
+  elif "RS Edge" in sort_choice:
+    results_list = sorted(
+        results_list, key=lambda r: r.factor_edge, reverse=True
+    )
+  elif "ADR %" in sort_choice:
+    results_list = sorted(results_list, key=lambda r: r.adr_pct, reverse=True)
+  elif "Tightest Base" in sort_choice:
+    results_list = sorted(results_list, key=lambda r: r.entry_risk_sma20)
+
+  st.success(f"Found {len(results_list)} matching candidates!")
+
+  CHARTS_PER_PAGE = 4
+  total_pages = max(1, (len(results_list) - 1) // CHARTS_PER_PAGE + 1)
+
+  page_state_key = (
+      f"page_num_{key_prefix}_{run_cap.replace(' ', '_').lower()}_{run_mode.lower()}"
+  )
+  if page_state_key not in st.session_state:
+    st.session_state[page_state_key] = 1
+
+  if st.session_state[page_state_key] > total_pages:
+    st.session_state[page_state_key] = total_pages
+
+  current_page = st.session_state[page_state_key]
+
+  st.markdown("---")
+  col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+  with col_p1:
+    st.button(
+        "⬅️ Prev",
+        key=f"top_prev_{key_prefix}_{run_cap}_{run_mode}",
+        use_container_width=True,
+        on_click=change_page,
+        args=(page_state_key, -1, total_pages),
+    )
+  with col_p2:
+    top_num_key = f"top_num_{key_prefix}_{run_cap}_{run_mode}"
+    st.number_input(
+        "Page",
+        min_value=1,
+        max_value=total_pages,
+        value=int(current_page),
+        step=1,
+        key=top_num_key,
+        label_visibility="collapsed",
+        on_change=set_page_direct,
+        args=(page_state_key, top_num_key),
+    )
+  with col_p3:
+    st.button(
+        "Next ➡️",
+        key=f"top_next_{key_prefix}_{run_cap}_{run_mode}",
+        use_container_width=True,
+        on_click=change_page,
+        args=(page_state_key, 1, total_pages),
+    )
+
+  start_idx = (current_page - 1) * CHARTS_PER_PAGE
+  end_idx = start_idx + CHARTS_PER_PAGE
+  page_results = results_list[start_idx:end_idx]
+
+  st.markdown(
+      f"<p style='text-align: center; color: #888; font-size: 0.85rem;'>Page"
+      f" <b>{current_page}</b> of <b>{total_pages}</b> &nbsp;|&nbsp; Showing"
+      f" matches <b>{start_idx + 1}</b> to"
+      f" <b>{min(end_idx, len(results_list))}</b> of {len(results_list)}</p>",
+      unsafe_allow_html=True,
+  )
+
+  for idx in range(0, len(page_results), 3):
+    chunk = page_results[idx : idx + 3]
+    cols = st.columns(3)
+    for col, r in zip(cols, chunk):
+      with col:
+        sec_badge = (
+            f"Rank #{r.sector_rank}" if r.sector_rank < 99 else "Unranked"
+        )
+        st.markdown(
+            f"### 📊 {r.ticker} <span"
+            f" style='font-size:0.75rem; color:#00BFFF;'>({r.sector} •"
+            f" {sec_badge})</span>",
+            unsafe_allow_html=True,
+        )
+
+        m_c1, m_c2, m_c3 = st.columns(3)
+        m_c1.metric("Close", f"${r.close:.2f}")
+
+        if isinstance(r, EPResult):
+          m_c2.metric("Gap %", f"+{r.gap_pct:.1f}%")
+          m_c3.metric("RVOL", f"{r.rvol:.1f}x")
+        else:
+          m_c2.metric("Asymmetric Edge", f"{r.factor_edge:+.2f}")
+          m_c3.metric("ADR%", f"{r.adr_pct:.2f}%")
+
+        render_tv_chart(r.ticker, mode=run_mode)
+
+  st.markdown("---")
+  col_b1, col_b2, col_b3 = st.columns([1, 2, 1])
+  with col_b1:
+    st.button(
+        "⬅️ Prev",
+        key=f"bot_prev_{key_prefix}_{run_cap}_{run_mode}",
+        use_container_width=True,
+        on_click=change_page,
+        args=(page_state_key, -1, total_pages),
+    )
+  with col_b2:
+    bot_num_key = f"bot_num_{key_prefix}_{run_cap}_{run_mode}"
+    st.number_input(
+        "Page",
+        min_value=1,
+        max_value=total_pages,
+        value=int(current_page),
+        step=1,
+        key=bot_num_key,
+        label_visibility="collapsed",
+        on_change=set_page_direct,
+        args=(page_state_key, bot_num_key),
+    )
+  with col_b3:
+    st.button(
+        "Next ➡️",
+        key=f"bot_next_{key_prefix}_{run_cap}_{run_mode}",
+        use_container_width=True,
+        on_click=change_page,
+        args=(page_state_key, 1, total_pages),
+    )
+
+
+# --- TAB 2: ACTIVE SCREENER ---
+with tab_screener:
+  if st.session_state.get(scan_key) is not None:
+    display_paginated_charts(
+        st.session_state[scan_key],
+        key_prefix="rs",
+        run_mode=mode_clean,
+        run_cap=cap_clean,
+    )
+  else:
+    st.info(
+        "👈 Click **'Execute Selected Scan Setup'** in the sidebar to run the"
+        " screener."
+    )
+
+# --- TAB 3: OPTIMAL ENTRIES / BASES ---
+with tab_entries:
+  if st.session_state.get(scan_key) is not None:
+    display_paginated_charts(
+        st.session_state[scan_key],
+        key_prefix="entry",
+        run_mode=mode_clean,
+        run_cap=cap_clean,
+    )
+  else:
+    st.info(
+        "👈 Click **'Execute Selected Scan Setup'** in the sidebar to load"
+        " entry setups."
+    )
