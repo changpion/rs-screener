@@ -656,4 +656,5 @@ run_scan = st.sidebar.button(
 )
 
 scan_key = f"scan_results_{cap_clean.replace(' ', '_').lower()}_{mode_clean.lower()}"
-if scan_key not in
+if scan_key not in st.session_state:
+    st.session_state[scan_key] = None
