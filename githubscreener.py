@@ -18,11 +18,10 @@ HEADERS = {
     )
 }
 MIN_BARS = 130  # Required for 120-day (6-month) RS calculation
-MAX_TICKERS_LIMIT = 700  # Safe cap to accommodate S&P 600 (~600 symbols)
+MAX_TICKERS_LIMIT = 700  # Safe cap per cap-size bucket
 
-# Expanded Sector & Industry Bellwethers Map
+# Sector & Industry Bellwethers Map
 SECTOR_MAP = {
-    # Broad GICS Sectors
     "XLK": "Technology",
     "XLY": "Consumer Discretionary",
     "XLC": "Communications",
@@ -34,7 +33,6 @@ SECTOR_MAP = {
     "XLB": "Materials",
     "XLU": "Utilities",
     "XLRE": "Real Estate",
-    # High-Beta Industry Focus
     "SMH": "Semiconductors",
     "IGV": "Software",
     "XBI": "Biotech",
@@ -55,13 +53,14 @@ def get_http_session():
       status_forcelist=[429, 500, 502, 503, 504],
   )
   adapter = HTTPAdapter(
-      pool_connections=20, pool_maxsize=20, max_retries=retry_strategy
+      pool_connections=25, pool_maxsize=25, max_retries=retry_strategy
   )
   session.mount("https://", adapter)
   session.mount("http://", adapter)
   return session
 
 
+# --- DATACLASSES ---
 @dataclass
 class ScreenResult:
   ticker: str
@@ -90,25 +89,35 @@ class ScreenResult:
     return abs(self.dist_sma20)
 
 
-# --- ASYMMETRIC MULTI-TIMEFRAME RS & QUANT MATH ---
-def calc_rs_metrics(df, mode="Long"):
-  """Calculates Asymmetric Composite RS Score weighted across 1M, 3M, and 6M.
+@dataclass
+class EPResult:
+  ticker: str
+  close: float
+  gap_pct: float
+  rvol: float
+  base_range_pct: float
+  adr_pct: float
 
-  - Longs: Denominator is Downside Deviation (penalizes only red pullbacks).
-  - Shorts: Denominator is Upside Deviation (penalizes only green squeeze
-  bounces).
-  """
+  @property
+  def factor_edge(self) -> float:
+    return self.gap_pct
+
+  @property
+  def entry_risk_sma20(self) -> float:
+    return self.base_range_pct
+
+
+# --- ASYMMETRIC MULTI-TIMEFRAME RS MATH ---
+def calc_rs_metrics(df, mode="Long"):
   closes = df["close"]
   if len(closes) < MIN_BARS:
     return None
 
-  # Multi-window returns
   ret_20 = (closes.iloc[-1] / closes.iloc[-20] - 1) * 100
   ret_60 = (closes.iloc[-1] / closes.iloc[-60] - 1) * 100
   ret_120 = (closes.iloc[-1] / closes.iloc[-120] - 1) * 100
   composite_return = (0.4 * ret_20) + (0.4 * ret_60) + (0.2 * ret_120)
 
-  # Asymmetric Volatility Calculation over recent month (20 bars)
   bar_returns = closes.iloc[-20:].pct_change().dropna()
 
   if mode == "Long":
@@ -133,7 +142,6 @@ def calc_rs_metrics(df, mode="Long"):
     inverted_return = -composite_return
     composite_rs = inverted_return / risk_metric
 
-  # ADR% Calculation (Average Daily Range over 20 days)
   if "high" in df.columns and "low" in df.columns:
     daily_range = (
         (df["high"].iloc[-20:] - df["low"].iloc[-20:]) / df["low"].iloc[-20:]
@@ -142,7 +150,6 @@ def calc_rs_metrics(df, mode="Long"):
   else:
     adr_pct = float(risk_metric * 1.5)
 
-  # Volume Dry-Up Ratio (5-day avg volume vs 20-day avg volume)
   if "volume" in df.columns:
     vol_5 = df["volume"].iloc[-5:].mean()
     vol_20 = df["volume"].iloc[-20:].mean()
@@ -158,28 +165,30 @@ def calc_rs_metrics(df, mode="Long"):
   )
 
 
+# --- TICKER LIST PARSER ---
 @st.cache_data(ttl=86400)
 def get_us_tickers(cap_size="Mid"):
   session = get_http_session()
   try:
     if cap_size == "Small":
       url = "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"
-      table_match = "Symbol"
     elif cap_size == "Mid":
       url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
-      table_match = "Symbol"
-    else:
+    elif cap_size == "Large":
       url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-      table_match = "Symbol"
+    else:  # Combined S&P 1500 Universe
+      t_large = get_us_tickers("Large")
+      t_mid = get_us_tickers("Mid")
+      t_small = get_us_tickers("Small")
+      return sorted(list(set(t_large + t_mid + t_small)))
 
     resp = session.get(url, timeout=15)
     resp.raise_for_status()
 
-    # Use match parameter to reliably select the main component stocks table
-    dfs = pd.read_html(StringIO(resp.text), match=table_match)
+    # Match table containing symbol data
+    dfs = pd.read_html(StringIO(resp.text), match="Symbol")
     df = dfs[0]
 
-    # Explicitly search for symbol / ticker columns to bypass shifting wiki layouts
     ticker_col = next(
         (
             col
@@ -190,7 +199,7 @@ def get_us_tickers(cap_size="Mid"):
     )
 
     if ticker_col is None:
-      raise ValueError("Ticker/Symbol column not found in Wikipedia table.")
+      raise ValueError("Ticker column not identified in table.")
 
     tickers = (
         df[ticker_col]
@@ -201,13 +210,12 @@ def get_us_tickers(cap_size="Mid"):
         .tolist()
     )
 
-    cleaned_tickers = sorted(list(set(tickers)))
-    return cleaned_tickers[:MAX_TICKERS_LIMIT]
+    return sorted(list(set(tickers)))[:MAX_TICKERS_LIMIT]
 
   except Exception as e:
     st.warning(
-        f"⚠️ Warning: Could not fetch live Wikipedia list for {cap_size} Cap"
-        f" ({e}). Falling back to default list."
+        f"⚠️ Warning: Live ticker fetch for {cap_size} Cap failed ({e})."
+        " Using default fallbacks."
     )
     return [
         "AAPL",
@@ -239,9 +247,10 @@ def fetch_daily_ohlcv(ticker):
     quote = result["indicators"]["quote"][0]
     df = pd.DataFrame(
         {
-            "close": quote.get("close"),
+            "open": quote.get("open"),
             "high": quote.get("high"),
             "low": quote.get("low"),
+            "close": quote.get("close"),
             "volume": quote.get("volume"),
         },
         index=pd.to_datetime(result["timestamp"], unit="s", utc=True),
@@ -285,7 +294,7 @@ def get_quant_sector_strength(spy_df, mode="Long"):
   return None
 
 
-# --- DEDICATED LONG SCREENER ---
+# --- SCREENER ENGINES ---
 def screen_long_ticker(ticker, df, spy_metrics):
   df = df.copy()
   df["EMA10"] = df["close"].ewm(span=10, adjust=False).mean()
@@ -321,7 +330,6 @@ def screen_long_ticker(ticker, df, spy_metrics):
   )
 
 
-# --- DEDICATED SHORT SCREENER ---
 def screen_short_ticker(ticker, df, spy_metrics):
   df = df.copy()
   df["EMA10"] = df["close"].ewm(span=10, adjust=False).mean()
@@ -357,9 +365,59 @@ def screen_short_ticker(ticker, df, spy_metrics):
   )
 
 
+def screen_ep_ticker(ticker, df):
+  """Qullamaggie Episodic Pivot (EP) Setup Screen:
+
+  1. Gap % >= +8.0% (Today Open vs Yesterday Close) 2. Relative Volume (RVOL)
+  >= 2.5x 20-day Average 3. Prior 60-bar base range check (Consolidation filter)
+  """
+  if df is None or len(df) < 65:
+    return None
+
+  prev_close = float(df["close"].iloc[-2])
+  today_open = float(
+      df["open"].iloc[-1] if not pd.isna(df["open"].iloc[-1]) else prev_close
+  )
+  today_close = float(df["close"].iloc[-1])
+  today_vol = float(df["volume"].iloc[-1])
+
+  gap_pct = ((today_open - prev_close) / prev_close) * 100
+  if gap_pct < 8.0:
+    return None
+
+  vol_20_sma = df["volume"].iloc[-21:-1].mean()
+  if vol_20_sma <= 0:
+    return None
+
+  rvol = today_vol / vol_20_sma
+  if rvol < 2.5:
+    return None
+
+  prior_60 = df.iloc[-61:-1]
+  base_high = prior_60["high"].max()
+  base_low = prior_60["low"].min()
+  base_range_pct = (
+      ((base_high - base_low) / base_low) * 100 if base_low > 0 else 0.0
+  )
+
+  daily_range = (
+      (df["high"].iloc[-20:] - df["low"].iloc[-20:]) / df["low"].iloc[-20:]
+  ) * 100
+  adr_pct = float(daily_range.mean())
+
+  return EPResult(
+      ticker=ticker,
+      close=today_close,
+      gap_pct=gap_pct,
+      rvol=rvol,
+      base_range_pct=base_range_pct,
+      adr_pct=adr_pct,
+  )
+
+
 def render_tv_chart(ticker: str, mode="Long"):
-  ma_color_1 = "#00BFFF" if mode == "Long" else "#FF4B4B"
-  ma_color_2 = "#1E90FF" if mode == "Long" else "#FFA500"
+  ma_color_1 = "#00BFFF" if mode != "Short" else "#FF4B4B"
+  ma_color_2 = "#1E90FF" if mode != "Short" else "#FFA500"
   tv_symbol = ticker.replace("-", ".")
 
   widget_html = f"""
@@ -397,12 +455,15 @@ def render_tv_chart(ticker: str, mode="Long"):
 
 
 # --- STREAMLIT UI SETUP ---
-st.set_page_config(page_title="Asymmetric Multi-Directional Screener", layout="wide")
+st.set_page_config(
+    page_title="Asymmetric Momentum & EP Screener", layout="wide"
+)
 
 st.sidebar.header("🧭 Navigation & Strategy")
 strategy_mode = st.sidebar.radio(
     "Select Trading Bias Mode:",
     [
+        "🔥 Episodic Pivot (EP) Gap Setup",
         "🚀 Mid Cap Long Setup",
         "💥 Mid Cap Short Setup",
         "📈 Large Cap Long Setup",
@@ -412,17 +473,21 @@ strategy_mode = st.sidebar.radio(
     ],
 )
 
-if "Mid Cap" in strategy_mode:
+if "EP" in strategy_mode:
+  cap_clean = "Combined S&P 1500"
+  mode_clean = "EP"
+elif "Mid Cap" in strategy_mode:
   cap_clean = "Mid"
+  mode_clean = "Long" if "Long" in strategy_mode else "Short"
 elif "Small Cap" in strategy_mode:
   cap_clean = "Small"
+  mode_clean = "Long" if "Long" in strategy_mode else "Short"
 else:
   cap_clean = "Large"
-
-mode_clean = "Long" if "Long Setup" in strategy_mode else "Short"
+  mode_clean = "Long" if "Long" in strategy_mode else "Short"
 
 st.title(
-    f"{strategy_mode} ({'Asymmetric Downside Risk Long' if mode_clean == 'Long' else 'Asymmetric Upside Risk Short'})"
+    f"{strategy_mode} ({'Qullamaggie Institutional Gap' if mode_clean == 'EP' else ('Downside Risk Long' if mode_clean == 'Long' else 'Upside Risk Short')})"
 )
 
 st.markdown(
@@ -444,14 +509,14 @@ if "spy_data" not in st.session_state or st.session_state.spy_data is None:
 
 tab_home, tab_screener, tab_entries = st.tabs([
     "📊 Sector Performance Tracker",
-    "🔍 Live Multi-Timeframe RS Screener",
-    "🎯 Optimal Entry Risk Profile",
+    "🔍 Live Multi-Timeframe RS / EP Screener",
+    "🎯 Optimal Entry / Tight Base Profile",
 ])
 
 # --- TAB 1: QUANT SECTOR OVERVIEW ---
 with tab_home:
   st.header(
-      f"📊 Asymmetric Sector RS Tracker ({'Long Leader' if mode_clean == 'Long' else 'Short Deficit'})"
+      f"📊 Asymmetric Sector RS Tracker ({'Long Leader' if mode_clean != 'Short' else 'Short Deficit'})"
   )
   st.write(
       "Sectors and high-beta industry ETFs ranked against SPY using"
@@ -461,33 +526,27 @@ with tab_home:
   if st.session_state.spy_data is None:
     st.error("Failed to fetch SPY benchmark data.")
   else:
-    cache_key = f"sector_df_{mode_clean}"
+    cache_key = (
+        f"sector_df_{'Long' if mode_clean != 'Short' else 'Short'}"
+    )
     if (
         st.button("🔄 Refresh Sector Metrics")
         or cache_key not in st.session_state
     ):
-      with st.spinner("Re-calculating asymmetric sector math..."):
+      with st.spinner("Re-calculating sector metrics..."):
         st.session_state[cache_key] = get_quant_sector_strength(
-            st.session_state.spy_data, mode=mode_clean
+            st.session_state.spy_data,
+            mode=("Long" if mode_clean != "Short" else "Short"),
         )
 
     sectors_df = st.session_state.get(cache_key)
-
     if sectors_df is not None and not sectors_df.empty:
       prime_sector = sectors_df.iloc[0]
-      if mode_clean == "Long":
-        st.success(
-            f"🔥 **Leading Market Sector:** {prime_sector['Sector Name']}"
-            f" ({prime_sector['ETF']}) with Asymmetric RS Edge of"
-            f" **{prime_sector['RS Factor Edge']:+.2f}**"
-        )
-      else:
-        st.error(
-            f"⚠️ **Weakest Market Sector:** {prime_sector['Sector Name']}"
-            f" ({prime_sector['ETF']}) with Asymmetric RS Score of"
-            f" **{prime_sector['RS Factor Edge']:+.2f}**"
-        )
-
+      st.success(
+          f"🔥 **Top Sector Focus:** {prime_sector['Sector Name']}"
+          f" ({prime_sector['ETF']}) with RS Edge of"
+          f" **{prime_sector['RS Factor Edge']:+.2f}**"
+      )
       st.dataframe(sectors_df, hide_index=True, use_container_width=True)
 
 # --- SIDEBAR CONTROL SCAN ACTION ---
@@ -497,7 +556,7 @@ run_scan = st.sidebar.button(
     f"🚀 Execute Selected Scan Setup", type="primary", use_container_width=True
 )
 
-scan_key = f"scan_results_{cap_clean.lower()}_{mode_clean.lower()}"
+scan_key = f"scan_results_{cap_clean.replace(' ', '_').lower()}_{mode_clean.lower()}"
 if scan_key not in st.session_state:
   st.session_state[scan_key] = None
 
@@ -511,10 +570,13 @@ if run_scan:
     status_text = st.empty()
     progress_bar = st.progress(0)
 
-    status_text.text("Calculating Asymmetric Multi-Timeframe SPY Baseline...")
-    spy_metrics = calc_rs_metrics(st.session_state.spy_data, mode=mode_clean)
-
+    status_text.text("Fetching Ticker Universe...")
     tickers = get_us_tickers(cap_size=cap_clean)
+    spy_metrics = (
+        calc_rs_metrics(st.session_state.spy_data, mode="Long")
+        if mode_clean != "Short"
+        else calc_rs_metrics(st.session_state.spy_data, mode="Short")
+    )
     results = []
 
     status_text.text(
@@ -522,7 +584,7 @@ if run_scan:
         " parameters..."
     )
 
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=20) as pool:
       futures = {pool.submit(fetch_daily_ohlcv, t): t for t in tickers}
       for i, future in enumerate(as_completed(futures)):
         ticker = futures[future]
@@ -530,16 +592,19 @@ if run_scan:
         try:
           df = future.result()
           if df is not None:
-            if mode_clean == "Long":
+            if mode_clean == "EP":
+              hit = screen_ep_ticker(ticker, df)
+            elif mode_clean == "Long":
               hit = screen_long_ticker(ticker, df, spy_metrics)
             else:
               hit = screen_short_ticker(ticker, df, spy_metrics)
+
             if hit:
               results.append(hit)
         except Exception:
           pass
 
-    status_text.text("Completed asymmetric scan successfully!")
+    status_text.text("Completed scan successfully!")
     progress_bar.empty()
     st.session_state[scan_key] = results
 
@@ -561,13 +626,13 @@ def display_paginated_charts(
     st.info("No tickers matched the current scan criteria.")
     return
 
-  st.success(f"Found {len(results_list)} matching {run_cap} Cap candidates!")
+  st.success(f"Found {len(results_list)} matching candidates!")
 
   CHARTS_PER_PAGE = 4
   total_pages = max(1, (len(results_list) - 1) // CHARTS_PER_PAGE + 1)
 
   page_state_key = (
-      f"page_num_{key_prefix}_{run_cap.lower()}_{run_mode.lower()}"
+      f"page_num_{key_prefix}_{run_cap.replace(' ', '_').lower()}_{run_mode.lower()}"
   )
   if page_state_key not in st.session_state:
     st.session_state[page_state_key] = 1
@@ -629,8 +694,14 @@ def display_paginated_charts(
         st.markdown(f"### 📊 {r.ticker}")
         m_c1, m_c2, m_c3 = st.columns(3)
         m_c1.metric("Close", f"${r.close:.2f}")
-        m_c2.metric("Asymmetric RS Edge", f"{r.factor_edge:+.2f}")
-        m_c3.metric("ADR%", f"{r.adr_pct:.2f}%")
+
+        if isinstance(r, EPResult):
+          m_c2.metric("Gap %", f"+{r.gap_pct:.1f}%")
+          m_c3.metric("RVOL", f"{r.rvol:.1f}x")
+        else:
+          m_c2.metric("Asymmetric Edge", f"{r.factor_edge:+.2f}")
+          m_c3.metric("ADR%", f"{r.adr_pct:.2f}%")
+
         render_tv_chart(r.ticker, mode=run_mode)
 
   st.markdown("---")
@@ -669,29 +740,32 @@ def display_paginated_charts(
 # --- TAB 2: ACTIVE SCREENER ---
 with tab_screener:
   if st.session_state.get(scan_key) is not None:
-    rs_sorted = sorted(
+    sorted_results = sorted(
         st.session_state[scan_key], key=lambda r: r.factor_edge, reverse=True
     )
     display_paginated_charts(
-        rs_sorted, key_prefix="rs", run_mode=mode_clean, run_cap=cap_clean
+        sorted_results, key_prefix="rs", run_mode=mode_clean, run_cap=cap_clean
     )
   else:
     st.info(
-        "👈 Please click **'Execute Selected Scan Setup'** in the sidebar to"
-        " run the momentum screener."
+        "👈 Click **'Execute Selected Scan Setup'** in the sidebar to run the"
+        " screener."
     )
 
-# --- TAB 3: OPTIMAL ENTRIES ---
+# --- TAB 3: OPTIMAL ENTRIES / BASES ---
 with tab_entries:
   if st.session_state.get(scan_key) is not None:
-    entry_sorted = sorted(
+    sorted_entries = sorted(
         st.session_state[scan_key], key=lambda r: r.entry_risk_sma20
     )
     display_paginated_charts(
-        entry_sorted, key_prefix="entry", run_mode=mode_clean, run_cap=cap_clean
+        sorted_entries,
+        key_prefix="entry",
+        run_mode=mode_clean,
+        run_cap=cap_clean,
     )
   else:
     st.info(
-        "👈 Please click **'Execute Selected Scan Setup'** in the sidebar to"
-        " load optimal entries."
+        "👈 Click **'Execute Selected Scan Setup'** in the sidebar to load"
+        " entry setups."
     )
