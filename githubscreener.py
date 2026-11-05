@@ -18,7 +18,7 @@ HEADERS = {
     )
 }
 MIN_BARS = 130  # Required for 120-day (6-month) RS calculation
-MAX_TICKERS_LIMIT = 700  # Safe cap per cap-size bucket
+MAX_TICKERS_LIMIT = 1500  # Safe cap per cap-size bucket
 
 # Sector & Industry Bellwethers Map
 SECTOR_MAP = {
