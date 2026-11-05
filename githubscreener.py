@@ -753,13 +753,17 @@ def set_page_direct(state_key, input_key):
 
 
 def display_paginated_charts(
-    results_list, key_prefix="screener", run_mode="Long", run_cap="Mid"
+    results_list,
+    key_prefix="screener",
+    run_mode="Long",
+    run_cap="Mid",
+    default_sort_idx=0,
 ):
   if not results_list:
     st.info("No tickers matched the current scan criteria.")
     return
 
-  # --- MULTI-FACTOR SORTING DROPDOWN (RS Edge is default index 0) ---
+  # --- MULTI-FACTOR SORTING DROPDOWN ---
   col_sort1, col_sort2 = st.columns([2, 1])
   with col_sort1:
     sort_choice = st.selectbox(
@@ -770,6 +774,7 @@ def display_paginated_charts(
             "⚡ ADR % (Highest Volatility)",
             "🎯 Tightest Base / Risk to SMA20",
         ],
+        index=default_sort_idx,
         key=f"sort_select_{key_prefix}",
     )
 
@@ -914,6 +919,7 @@ with tab_screener:
         key_prefix="rs",
         run_mode=mode_clean,
         run_cap=cap_clean,
+        default_sort_idx=0,  # RS Edge / Gap % default
     )
   else:
     st.info(
@@ -929,6 +935,7 @@ with tab_entries:
         key_prefix="entry",
         run_mode=mode_clean,
         run_cap=cap_clean,
+        default_sort_idx=3,  # Tightest Base / Risk to SMA20 default
     )
   else:
     st.info(
