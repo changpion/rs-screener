@@ -18,7 +18,7 @@ HEADERS = {
     )
 }
 MIN_BARS = 130  # Required for 120-day (6-month) RS calculation
-MAX_TICKERS_LIMIT = 500
+MAX_TICKERS_LIMIT = 700  # Safe cap to accommodate S&P 600 (~600 symbols)
 
 # Expanded Sector & Industry Bellwethers Map
 SECTOR_MAP = {
@@ -162,22 +162,36 @@ def calc_rs_metrics(df, mode="Long"):
 def get_us_tickers(cap_size="Mid"):
   session = get_http_session()
   try:
-    url = (
-        "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
-        if cap_size == "Mid"
-        else "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    )
-    resp = session.get(url, timeout=15)
-    df = pd.read_html(StringIO(resp.text))[0]
+    if cap_size == "Small":
+      url = "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"
+      table_match = "Symbol"
+    elif cap_size == "Mid":
+      url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
+      table_match = "Symbol"
+    else:
+      url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+      table_match = "Symbol"
 
+    resp = session.get(url, timeout=15)
+    resp.raise_for_status()
+
+    # Use match parameter to reliably select the main component stocks table
+    dfs = pd.read_html(StringIO(resp.text), match=table_match)
+    df = dfs[0]
+
+    # Explicitly search for symbol / ticker columns to bypass shifting wiki layouts
     ticker_col = next(
         (
             col
             for col in df.columns
             if "symbol" in str(col).lower() or "ticker" in str(col).lower()
         ),
-        df.columns[0],
+        None,
     )
+
+    if ticker_col is None:
+      raise ValueError("Ticker/Symbol column not found in Wikipedia table.")
+
     tickers = (
         df[ticker_col]
         .dropna()
@@ -187,8 +201,14 @@ def get_us_tickers(cap_size="Mid"):
         .tolist()
     )
 
-    return sorted(list(set(tickers[:MAX_TICKERS_LIMIT])))
-  except Exception:
+    cleaned_tickers = sorted(list(set(tickers)))
+    return cleaned_tickers[:MAX_TICKERS_LIMIT]
+
+  except Exception as e:
+    st.warning(
+        f"⚠️ Warning: Could not fetch live Wikipedia list for {cap_size} Cap"
+        f" ({e}). Falling back to default list."
+    )
     return [
         "AAPL",
         "MSFT",
@@ -387,10 +407,18 @@ strategy_mode = st.sidebar.radio(
         "💥 Mid Cap Short Setup",
         "📈 Large Cap Long Setup",
         "📉 Large Cap Short Setup",
+        "🔬 Small Cap Long Setup",
+        "⚡ Small Cap Short Setup",
     ],
 )
 
-cap_clean = "Mid" if "Mid Cap" in strategy_mode else "Large"
+if "Mid Cap" in strategy_mode:
+  cap_clean = "Mid"
+elif "Small Cap" in strategy_mode:
+  cap_clean = "Small"
+else:
+  cap_clean = "Large"
+
 mode_clean = "Long" if "Long Setup" in strategy_mode else "Short"
 
 st.title(
