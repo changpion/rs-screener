@@ -107,7 +107,7 @@ class EPResult:
     return self.base_range_pct
 
 
-# --- ASYMMETRIC MULTI-TIMEFRAME RS MATH ---
+# --- QUANT MATH & METRICS ---
 def calc_rs_metrics(df, mode="Long"):
   closes = df["close"]
   if len(closes) < MIN_BARS:
@@ -165,6 +165,46 @@ def calc_rs_metrics(df, mode="Long"):
   )
 
 
+# --- MARKET HEALTH TRAFFIC LIGHT (SUGGESTION 3) ---
+def get_market_health_status(spy_df, qqq_df):
+  if spy_df is None or qqq_df is None:
+    return "UNKNOWN", "#888888", "Data Unavailable"
+
+  def eval_index(df):
+    closes = df["close"]
+    ema10 = closes.ewm(span=10, adjust=False).mean().iloc[-1]
+    sma20 = closes.rolling(20).mean().iloc[-1]
+    last_close = closes.iloc[-1]
+    if last_close > ema10 and ema10 > sma20:
+      return 2  # Full Bull
+    elif last_close > sma20:
+      return 1  # Moderate/Pullback
+    return 0  # Bearish/Defense
+
+  spy_score = eval_index(spy_df)
+  qqq_score = eval_index(qqq_df)
+  total = spy_score + qqq_score
+
+  if total >= 3:
+    return (
+        "🟢 GREEN: Aggressive Long Environment",
+        "#00C853",
+        "SPY & QQQ > 10 EMA > 20 SMA. Full position sizing enabled.",
+    )
+  elif total >= 1:
+    return (
+        "🟡 YELLOW: Selective / Pullback Tape",
+        "#FFD600",
+        "Indices pulling back near support. Reduce sizing (0.25%-0.5% risk).",
+    )
+  else:
+    return (
+        "🔴 RED: Defensive / High Risk",
+        "#D50000",
+        "Indices below key MAs. Avoid breakout long entries or preserve cash.",
+    )
+
+
 # --- TICKER LIST PARSER ---
 @st.cache_data(ttl=86400)
 def get_us_tickers(cap_size="Mid"):
@@ -176,7 +216,7 @@ def get_us_tickers(cap_size="Mid"):
       url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
     elif cap_size == "Large":
       url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    else:  # Combined S&P 1500 Universe
+    else:  # Combined S&P 1500
       t_large = get_us_tickers("Large")
       t_mid = get_us_tickers("Mid")
       t_small = get_us_tickers("Small")
@@ -185,7 +225,6 @@ def get_us_tickers(cap_size="Mid"):
     resp = session.get(url, timeout=15)
     resp.raise_for_status()
 
-    # Match table containing symbol data
     dfs = pd.read_html(StringIO(resp.text), match="Symbol")
     df = dfs[0]
 
@@ -199,7 +238,7 @@ def get_us_tickers(cap_size="Mid"):
     )
 
     if ticker_col is None:
-      raise ValueError("Ticker column not identified in table.")
+      raise ValueError("Ticker column not identified.")
 
     tickers = (
         df[ticker_col]
@@ -366,11 +405,6 @@ def screen_short_ticker(ticker, df, spy_metrics):
 
 
 def screen_ep_ticker(ticker, df):
-  """Qullamaggie Episodic Pivot (EP) Setup Screen:
-
-  1. Gap % >= +8.0% (Today Open vs Yesterday Close) 2. Relative Volume (RVOL)
-  >= 2.5x 20-day Average 3. Prior 60-bar base range check (Consolidation filter)
-  """
   if df is None or len(df) < 65:
     return None
 
@@ -459,6 +493,27 @@ st.set_page_config(
     page_title="Asymmetric Momentum & EP Screener", layout="wide"
 )
 
+# Fetch Market Health Baseline Data
+if "spy_data" not in st.session_state or st.session_state.spy_data is None:
+  st.session_state.spy_data = fetch_daily_ohlcv("SPY")
+if "qqq_data" not in st.session_state or st.session_state.qqq_data is None:
+  st.session_state.qqq_data = fetch_daily_ohlcv("QQQ")
+
+# --- SIDEBAR: MARKET HEALTH TRAFFIC LIGHT ---
+st.sidebar.header("🚥 Market Health Status")
+status_title, status_color, status_desc = get_market_health_status(
+    st.session_state.spy_data, st.session_state.qqq_data
+)
+st.sidebar.markdown(
+    f"""
+    <div style="background-color: #1E1E1E; border: 1.5px solid {status_color}; padding: 10px; border-radius: 8px; margin-bottom: 15px;">
+        <h4 style="color: {status_color}; margin: 0 0 5px 0; font-size: 0.95rem;">{status_title}</h4>
+        <p style="color: #CCCCCC; margin: 0; font-size: 0.8rem;">{status_desc}</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.sidebar.header("🧭 Navigation & Strategy")
 strategy_mode = st.sidebar.radio(
     "Select Trading Bias Mode:",
@@ -504,8 +559,54 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "spy_data" not in st.session_state or st.session_state.spy_data is None:
-  st.session_state.spy_data = fetch_daily_ohlcv("SPY")
+# --- SIDEBAR: POSITION SIZING & ADR RISK CALCULATOR (SUGGESTION 1) ---
+st.sidebar.markdown("---")
+with st.sidebar.expander("🧮 Position Sizer & ADR Risk Calculator"):
+  acc_size = st.number_input(
+      "Account Capital ($)", value=100000, step=5000, key="calc_acc"
+  )
+  risk_pct = st.number_input(
+      "Account Risk %",
+      value=0.5,
+      step=0.1,
+      min_value=0.1,
+      max_value=3.0,
+      key="calc_risk",
+  )
+  entry_p = st.number_input(
+      "Planned Entry Price ($)", value=100.0, step=1.0, key="calc_entry"
+  )
+  stop_p = st.number_input(
+      "Stop Loss Price ($)", value=95.0, step=1.0, key="calc_stop"
+  )
+  est_adr = st.number_input(
+      "Stock ADR %", value=4.5, step=0.5, key="calc_adr"
+  )
+
+  risk_dollars = acc_size * (risk_pct / 100.0)
+  per_share_risk = abs(entry_p - stop_p)
+
+  if per_share_risk > 0:
+    shares = int(risk_dollars / per_share_risk)
+    total_position = shares * entry_p
+    stop_dist_pct = (per_share_risk / entry_p) * 100.0
+
+    st.markdown("---")
+    st.markdown(f"**Shares to Buy:** `{shares:,}` shares")
+    st.markdown(f"**Total Position:** `${total_position:,.2f}`")
+    st.markdown(f"**Total Dollar Risk:** `${risk_dollars:,.2f}`")
+    st.markdown(f"**Stop Distance:** `{stop_dist_pct:.2f}%`")
+
+    # ADR Compliance Safeguard Check
+    if stop_dist_pct > est_adr:
+      st.error(
+          f"⚠️ **Wide Stop Warning:** Stop distance ({stop_dist_pct:.2f}%) is"
+          f" larger than 1.0x ADR ({est_adr:.2f}%). Consider a tighter low-of-day stop."
+      )
+    else:
+      st.success("✅ Stop distance compliant with ADR volatility limits.")
+  else:
+    st.info("Entry and Stop price must be different.")
 
 tab_home, tab_screener, tab_entries = st.tabs([
     "📊 Sector Performance Tracker",
@@ -526,9 +627,7 @@ with tab_home:
   if st.session_state.spy_data is None:
     st.error("Failed to fetch SPY benchmark data.")
   else:
-    cache_key = (
-        f"sector_df_{'Long' if mode_clean != 'Short' else 'Short'}"
-    )
+    cache_key = f"sector_df_{'Long' if mode_clean != 'Short' else 'Short'}"
     if (
         st.button("🔄 Refresh Sector Metrics")
         or cache_key not in st.session_state
@@ -557,215 +656,4 @@ run_scan = st.sidebar.button(
 )
 
 scan_key = f"scan_results_{cap_clean.replace(' ', '_').lower()}_{mode_clean.lower()}"
-if scan_key not in st.session_state:
-  st.session_state[scan_key] = None
-
-if run_scan:
-  if st.session_state.spy_data is None:
-    st.session_state.spy_data = fetch_daily_ohlcv("SPY")
-
-  if st.session_state.spy_data is None:
-    st.error("Could not fetch SPY baseline structural indexes.")
-  else:
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-
-    status_text.text("Fetching Ticker Universe...")
-    tickers = get_us_tickers(cap_size=cap_clean)
-    spy_metrics = (
-        calc_rs_metrics(st.session_state.spy_data, mode="Long")
-        if mode_clean != "Short"
-        else calc_rs_metrics(st.session_state.spy_data, mode="Short")
-    )
-    results = []
-
-    status_text.text(
-        f"Screening {len(tickers)} symbols for {cap_clean} Cap {mode_clean}"
-        " parameters..."
-    )
-
-    with ThreadPoolExecutor(max_workers=20) as pool:
-      futures = {pool.submit(fetch_daily_ohlcv, t): t for t in tickers}
-      for i, future in enumerate(as_completed(futures)):
-        ticker = futures[future]
-        progress_bar.progress((i + 1) / len(tickers))
-        try:
-          df = future.result()
-          if df is not None:
-            if mode_clean == "EP":
-              hit = screen_ep_ticker(ticker, df)
-            elif mode_clean == "Long":
-              hit = screen_long_ticker(ticker, df, spy_metrics)
-            else:
-              hit = screen_short_ticker(ticker, df, spy_metrics)
-
-            if hit:
-              results.append(hit)
-        except Exception:
-          pass
-
-    status_text.text("Completed scan successfully!")
-    progress_bar.empty()
-    st.session_state[scan_key] = results
-
-
-def change_page(state_key, delta, max_p):
-  st.session_state[state_key] = max(
-      1, min(st.session_state[state_key] + delta, max_p)
-  )
-
-
-def set_page_direct(state_key, input_key):
-  st.session_state[state_key] = st.session_state[input_key]
-
-
-def display_paginated_charts(
-    results_list, key_prefix="screener", run_mode="Long", run_cap="Mid"
-):
-  if not results_list:
-    st.info("No tickers matched the current scan criteria.")
-    return
-
-  st.success(f"Found {len(results_list)} matching candidates!")
-
-  CHARTS_PER_PAGE = 4
-  total_pages = max(1, (len(results_list) - 1) // CHARTS_PER_PAGE + 1)
-
-  page_state_key = (
-      f"page_num_{key_prefix}_{run_cap.replace(' ', '_').lower()}_{run_mode.lower()}"
-  )
-  if page_state_key not in st.session_state:
-    st.session_state[page_state_key] = 1
-
-  if st.session_state[page_state_key] > total_pages:
-    st.session_state[page_state_key] = total_pages
-
-  current_page = st.session_state[page_state_key]
-
-  st.markdown("---")
-  col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
-  with col_p1:
-    st.button(
-        "⬅️ Prev",
-        key=f"top_prev_{key_prefix}_{run_cap}_{run_mode}",
-        use_container_width=True,
-        on_click=change_page,
-        args=(page_state_key, -1, total_pages),
-    )
-  with col_p2:
-    top_num_key = f"top_num_{key_prefix}_{run_cap}_{run_mode}"
-    st.number_input(
-        "Page",
-        min_value=1,
-        max_value=total_pages,
-        value=int(current_page),
-        step=1,
-        key=top_num_key,
-        label_visibility="collapsed",
-        on_change=set_page_direct,
-        args=(page_state_key, top_num_key),
-    )
-  with col_p3:
-    st.button(
-        "Next ➡️",
-        key=f"top_next_{key_prefix}_{run_cap}_{run_mode}",
-        use_container_width=True,
-        on_click=change_page,
-        args=(page_state_key, 1, total_pages),
-    )
-
-  start_idx = (current_page - 1) * CHARTS_PER_PAGE
-  end_idx = start_idx + CHARTS_PER_PAGE
-  page_results = results_list[start_idx:end_idx]
-
-  st.markdown(
-      f"<p style='text-align: center; color: #888; font-size: 0.85rem;'>Page"
-      f" <b>{current_page}</b> of <b>{total_pages}</b> &nbsp;|&nbsp; Showing"
-      f" matches <b>{start_idx + 1}</b> to"
-      f" <b>{min(end_idx, len(results_list))}</b> of {len(results_list)}</p>",
-      unsafe_allow_html=True,
-  )
-
-  for idx in range(0, len(page_results), 3):
-    chunk = page_results[idx : idx + 3]
-    cols = st.columns(3)
-    for col, r in zip(cols, chunk):
-      with col:
-        st.markdown(f"### 📊 {r.ticker}")
-        m_c1, m_c2, m_c3 = st.columns(3)
-        m_c1.metric("Close", f"${r.close:.2f}")
-
-        if isinstance(r, EPResult):
-          m_c2.metric("Gap %", f"+{r.gap_pct:.1f}%")
-          m_c3.metric("RVOL", f"{r.rvol:.1f}x")
-        else:
-          m_c2.metric("Asymmetric Edge", f"{r.factor_edge:+.2f}")
-          m_c3.metric("ADR%", f"{r.adr_pct:.2f}%")
-
-        render_tv_chart(r.ticker, mode=run_mode)
-
-  st.markdown("---")
-  col_b1, col_b2, col_b3 = st.columns([1, 2, 1])
-  with col_b1:
-    st.button(
-        "⬅️ Prev",
-        key=f"bot_prev_{key_prefix}_{run_cap}_{run_mode}",
-        use_container_width=True,
-        on_click=change_page,
-        args=(page_state_key, -1, total_pages),
-    )
-  with col_b2:
-    bot_num_key = f"bot_num_{key_prefix}_{run_cap}_{run_mode}"
-    st.number_input(
-        "Page",
-        min_value=1,
-        max_value=total_pages,
-        value=int(current_page),
-        step=1,
-        key=bot_num_key,
-        label_visibility="collapsed",
-        on_change=set_page_direct,
-        args=(page_state_key, bot_num_key),
-    )
-  with col_b3:
-    st.button(
-        "Next ➡️",
-        key=f"bot_next_{key_prefix}_{run_cap}_{run_mode}",
-        use_container_width=True,
-        on_click=change_page,
-        args=(page_state_key, 1, total_pages),
-    )
-
-
-# --- TAB 2: ACTIVE SCREENER ---
-with tab_screener:
-  if st.session_state.get(scan_key) is not None:
-    sorted_results = sorted(
-        st.session_state[scan_key], key=lambda r: r.factor_edge, reverse=True
-    )
-    display_paginated_charts(
-        sorted_results, key_prefix="rs", run_mode=mode_clean, run_cap=cap_clean
-    )
-  else:
-    st.info(
-        "👈 Click **'Execute Selected Scan Setup'** in the sidebar to run the"
-        " screener."
-    )
-
-# --- TAB 3: OPTIMAL ENTRIES / BASES ---
-with tab_entries:
-  if st.session_state.get(scan_key) is not None:
-    sorted_entries = sorted(
-        st.session_state[scan_key], key=lambda r: r.entry_risk_sma20
-    )
-    display_paginated_charts(
-        sorted_entries,
-        key_prefix="entry",
-        run_mode=mode_clean,
-        run_cap=cap_clean,
-    )
-  else:
-    st.info(
-        "👈 Click **'Execute Selected Scan Setup'** in the sidebar to load"
-        " entry setups."
-    )
+if scan_key not in
